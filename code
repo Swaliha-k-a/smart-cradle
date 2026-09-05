@@ -1,1 +1,210 @@
+"""
+Smart Cradle - Raspberry Pi Baby Monitoring System (Grove Edition)
+--------------------------------------------------------------------
+Follows the exact control flow from the project report flowchart (Section 5.3):
 
+    Start -> Initialize system -> Setup Wi-Fi (retry until connected)
+    -> Read sensor values
+    -> If cry=1?           No  -> Display "no cry"      -> back to Read sensor values
+                           Yes -> Servo motor on -> "Cry detected"
+    -> If temp=1? (valid)  No  -> Print read error       -> back to Read sensor values
+                           Yes -> Print temp.
+    -> If motion=1?        No  -> "No motion"            -> back to Read sensor values
+                           Yes -> "Movement detected"
+    -> If moisture=1?      No  -> "Dry"                  -> back to Read sensor values
+                           Yes -> "Wet"
+    -> ThingSpeak (log data) -> loop back to Read sensor values
+
+Hardware: Raspberry Pi + Grove Base Hat, with:
+  - Grove Moisture Sensor (analog)
+  - Grove Temperature & Humidity Sensor / DHT11 (digital)
+  - Grove PIR Motion Sensor (digital)
+  - Grove Sound Sensor / mic (analog) - used for cry detection
+  - Grove 16x2 LCD White on Blue (I2C)
+  - Servo Motor (PWM)
+
+Install the Grove library first:
+    curl -sL https://github.com/Seeed-Studio/grove.py/raw/master/install.sh | sudo bash -s -
+
+Run `grove_gpio` on the Pi to confirm which BCM pin number matches each
+physical slot you used, and update the pin numbers below accordingly.
+"""
+
+import time
+import socket
+import requests
+import RPi.GPIO as GPIO
+
+from grove.adc import ADC
+from grove.gpio import GPIO as GroveGPIO
+from grove.grove_temperature_humidity_sensor import DHT
+from grove.display.jhd1802 import JHD1802
+
+# ---------- ThingSpeak Settings ----------
+THINGSPEAK_API_KEY = "YOUR_THINGSPEAK_WRITE_API_KEY"
+THINGSPEAK_URL = "https://api.thingspeak.com/update"
+
+# ---------- Pin / Slot Definitions ----------
+# Analog slots (confirm with your Grove Base Hat's A0/A2/A4/A6 labeling)
+SOUND_ADC_CHANNEL = 2        # cry/sound sensor
+MOISTURE_ADC_CHANNEL = 0     # moisture sensor
+
+# Digital slots (BCM pin numbers - confirm with `grove_gpio`)
+DHT_PIN = 5
+PIR_PIN = 16
+SERVO_PIN = 12               # PWM-capable slot
+
+# ---------- Thresholds ----------
+# These are STARTING POINTS based on Seeed's own documentation/examples,
+# NOT measured from your actual hardware. You must run
+# sensor_calibration_test.py on your Pi and adjust these before your
+# final demo/submission.
+#
+# Sound: Seeed's own example output for this exact library on a Pi showed
+# baseline "quiet room" readings in the ~450-660 range, so the threshold
+# needs to sit clearly above that or it will misfire on ambient noise.
+# This is a rough starting point pending your own "quiet vs loud" test.
+SOUND_THRESHOLD = 900
+
+# Moisture: Seeed's official spec for this sensor lists 0-300 as dry,
+# 300-700 as moist, and 700-950 as wet/submerged - but that's on the
+# sensor's original 10-bit scale (0-1023). Your Grove Base Hat uses a
+# 12-bit ADC (0-4095), roughly 4x that range, so this value is scaled
+# up proportionally as a rough estimate. Confirm with your own
+# dry-vs-wet test before relying on this.
+MOISTURE_WET_THRESHOLD = 2800   # higher reading = wetter, per Seeed's spec
+
+# ---------- Setup ----------
+adc = ADC()
+dht_sensor = DHT('11', DHT_PIN)
+pir = GroveGPIO(PIR_PIN, GroveGPIO.IN)
+lcd = JHD1802()
+
+GPIO.setmode(GPIO.BCM)
+GPIO.setup(SERVO_PIN, GPIO.OUT)
+servo = GPIO.PWM(SERVO_PIN, 50)  # 50Hz standard for servos
+servo.start(0)
+
+
+def is_wifi_connected():
+    """Quick check for internet connectivity (used for the 'Setup Wifi' loop)."""
+    try:
+        socket.create_connection(("8.8.8.8", 53), timeout=3)
+        return True
+    except OSError:
+        return False
+
+
+def setup_wifi():
+    """Loop until Wi-Fi/internet connectivity is established, per the flowchart."""
+    print("Setting up Wi-Fi...")
+    while not is_wifi_connected():
+        print("Wi-Fi not established, retrying...")
+        time.sleep(3)
+    print("Wi-Fi connected.")
+
+
+def swing_cradle():
+    """Turn the servo motor on to rock the cradle."""
+    for angle in (60, 120, 60):
+        duty = 2 + (angle / 18)
+        servo.ChangeDutyCycle(duty)
+        time.sleep(0.5)
+    servo.ChangeDutyCycle(0)  # stop sending signal to avoid jitter
+
+
+def send_to_thingspeak(temperature, humidity, moisture_value):
+    payload = {
+        "api_key": THINGSPEAK_API_KEY,
+        "field1": temperature,
+        "field2": humidity,
+        "field3": moisture_value,
+    }
+    try:
+        response = requests.get(THINGSPEAK_URL, params=payload, timeout=5)
+        print(f"ThingSpeak update sent. Response: {response.status_code}")
+    except requests.exceptions.RequestException as e:
+        print(f"Error sending to ThingSpeak: {e}")
+
+
+def main():
+    print("Initializing system...")
+    lcd.setCursor(0, 0)
+    lcd.write("Smart Cradle")
+    lcd.setCursor(0, 1)
+    lcd.write("Initializing...")
+    time.sleep(2)
+
+    setup_wifi()
+
+    try:
+        while True:
+            # ---- Read sensor values ----
+            sound_value = adc.read(SOUND_ADC_CHANNEL)
+            humidity, temperature = dht_sensor.read()
+            motion_detected = pir.read()
+            moisture_value = adc.read(MOISTURE_ADC_CHANNEL)
+
+            lcd.clear()
+
+            # ---- Cry check ----
+            cry_detected = sound_value > SOUND_THRESHOLD
+            if not cry_detected:
+                lcd.setCursor(0, 0)
+                lcd.write("No cry")
+                print("No cry detected")
+                time.sleep(2)
+                continue  # loop back to reading sensor values
+
+            print("Cry detected - servo motor on")
+            swing_cradle()
+
+            # ---- Temperature check (valid reading?) ----
+            temp_valid = temperature is not None
+            if not temp_valid:
+                lcd.setCursor(0, 0)
+                lcd.write("Read error")
+                print("Temperature read error")
+                time.sleep(2)
+                continue
+
+            lcd.setCursor(0, 0)
+            lcd.write(f"Temp: {temperature:.0f}C")
+            print(f"Temperature: {temperature}C")
+
+            # ---- Motion check ----
+            if not motion_detected:
+                lcd.setCursor(0, 1)
+                lcd.write("No motion")
+                print("No motion detected")
+                time.sleep(2)
+                continue
+
+            lcd.setCursor(0, 1)
+            lcd.write("Movement!")
+            print("Movement detected")
+
+            # ---- Moisture check ----
+            is_wet = moisture_value > MOISTURE_WET_THRESHOLD
+            if not is_wet:
+                print("Dry")
+                time.sleep(2)
+                continue
+
+            print("Wet")
+
+            # ---- Log to ThingSpeak ----
+            send_to_thingspeak(temperature, humidity, moisture_value)
+
+            time.sleep(15)  # ThingSpeak free tier requires >=15s between updates
+
+    except KeyboardInterrupt:
+        print("Shutting down Smart Cradle system...")
+    finally:
+        servo.stop()
+        lcd.clear()
+        GPIO.cleanup()
+
+
+if __name__ == "__main__":
+    main()
