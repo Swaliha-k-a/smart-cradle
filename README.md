@@ -1,4 +1,4 @@
-# Smart Cradle — Raspberry Pi Baby Monitoring System
+# IOT BASED ADVANCED SMART CRADLE FOR BABY MONITORING SYSTEM
 
 An automated baby monitoring and soothing system built on a Raspberry Pi 4. It tracks temperature, humidity, moisture, motion, and sound around an infant, automatically rocks the cradle when the baby cries, displays live status on an LCD, and sends data to the cloud for remote monitoring.
 
