@@ -1,19 +1,21 @@
 """
 Smart Cradle - Raspberry Pi Baby Monitoring System (Grove Edition)
 --------------------------------------------------------------------
-Follows the exact control flow from the project report flowchart (Section 5.3):
+Follows the exact control flow from the project report flowchart:
 
     Start -> Initialize system -> Setup Wi-Fi (retry until connected)
-    -> Read sensor values
-    -> If cry=1?           No  -> Display "no cry"      -> back to Read sensor values
-                           Yes -> Servo motor on -> "Cry detected"
-    -> If temp=1? (valid)  No  -> Print read error       -> back to Read sensor values
-                           Yes -> Print temp.
-    -> If motion=1?        No  -> "No motion"            -> back to Read sensor values
-                           Yes -> "Movement detected"
-    -> If moisture=1?      No  -> "Dry"                  -> back to Read sensor values
-                           Yes -> "Wet"
-    -> ThingSpeak (log data) -> loop back to Read sensor values
+    -> Read sensor values  <---------------------------------------+
+    -> If moisture=1?  No  -> "dry"  -----------------+             |
+                       Yes -> "wet"  -----------------+             |
+    -> If sound=1?     No  -> (skip swing + motion, jump to temp) --+---+
+                       Yes -> "swing the cradle"                    |   |
+                              -> If motion detected? No -> "no motion" |
+                                                      Yes -> "motion detected"
+                              -> (falls through to temp check)      |   |
+    -> If temp>30?     No  -> loop back to "Read sensor values" ----+   |
+                       Yes -> "display" -> "thingspeak" -> stop         |
+                                                                          v
+                                                                    (temp check)
 
 Hardware: Raspberry Pi + Grove Base Hat, with:
   - Grove Moisture Sensor (analog)
@@ -28,6 +30,14 @@ Install the Grove library first:
 
 Run `grove_gpio` on the Pi to confirm which BCM pin number matches each
 physical slot you used, and update the pin numbers below accordingly.
+
+IMPORTANT NOTE ON THE FLOWCHART'S "stop" NODE:
+The flowchart's high-temperature branch ends at "stop" with no drawn
+arrow back to "Read sensor values". Since this is meant to run as a
+continuous monitor rather than a one-shot program, this implementation
+treats "stop" as "done handling this event" rather than "end the
+program": after logging to ThingSpeak, it loops back to reading sensor
+values and keeps monitoring indefinitely.
 """
 
 import time
@@ -73,6 +83,10 @@ SOUND_THRESHOLD = 900
 # up proportionally as a rough estimate. Confirm with your own
 # dry-vs-wet test before relying on this.
 MOISTURE_WET_THRESHOLD = 2800   # higher reading = wetter, per Seeed's spec
+
+# Temperature: alert threshold in degrees Celsius, per the flowchart's
+# "if temp>30" decision.
+TEMP_ALERT_THRESHOLD_C = 30
 
 # ---------- Setup ----------
 adc = ADC()
@@ -147,56 +161,62 @@ def main():
 
             lcd.clear()
 
-            # ---- Cry check ----
-            cry_detected = sound_value > SOUND_THRESHOLD
-            if not cry_detected:
-                lcd.setCursor(0, 0)
-                lcd.write("No cry")
-                print("No cry detected")
-                time.sleep(2)
-                continue  # loop back to reading sensor values
-
-            print("Cry detected - servo motor on")
-            swing_cradle()
-
-            # ---- Temperature check (valid reading?) ----
-            temp_valid = temperature is not None
-            if not temp_valid:
-                lcd.setCursor(0, 0)
-                lcd.write("Read error")
-                print("Temperature read error")
-                time.sleep(2)
-                continue
-
-            lcd.setCursor(0, 0)
-            lcd.write(f"Temp: {temperature:.0f}C")
-            print(f"Temperature: {temperature}C")
-
-            # ---- Motion check ----
-            if not motion_detected:
-                lcd.setCursor(0, 1)
-                lcd.write("No motion")
-                print("No motion detected")
-                time.sleep(2)
-                continue
-
-            lcd.setCursor(0, 1)
-            lcd.write("Movement!")
-            print("Movement detected")
-
-            # ---- Moisture check ----
+            # ---- Moisture check (display only - always continues) ----
             is_wet = moisture_value > MOISTURE_WET_THRESHOLD
             if not is_wet:
-                print("Dry")
+                lcd.setCursor(0, 0)
+                lcd.write("Dry")
+                print("Moisture: dry")
+            else:
+                lcd.setCursor(0, 0)
+                lcd.write("Wet")
+                print("Moisture: wet")
+
+            # ---- Sound / cry check ----
+            # No -> skip cradle swing AND motion check, go straight to temp check.
+            # Yes -> swing the cradle, then also run the motion check below.
+            cry_detected = sound_value > SOUND_THRESHOLD
+            if cry_detected:
+                print("Cry detected - swinging cradle")
+                swing_cradle()
+
+                # ---- Motion check (only reached when a cry was detected) ----
+                if not motion_detected:
+                    lcd.setCursor(0, 1)
+                    lcd.write("No motion")
+                    print("No motion detected")
+                else:
+                    lcd.setCursor(0, 1)
+                    lcd.write("Movement!")
+                    print("Motion detected")
+            else:
+                print("No cry detected - skipping cradle swing and motion check")
+
+            # ---- Temperature check ----
+            temp_valid = temperature is not None
+            if not temp_valid:
+                print("Temperature read error")
+                time.sleep(2)
+                continue  # back to Read sensor values
+
+            temp_alert = temperature > TEMP_ALERT_THRESHOLD_C
+            if not temp_alert:
+                # Per flowchart: temp <= 30 -> loop straight back to
+                # Read sensor values, skipping display and ThingSpeak.
                 time.sleep(2)
                 continue
 
-            print("Wet")
+            # ---- temp > 30: display, log to ThingSpeak, then stop ----
+            lcd.setCursor(0, 0)
+            lcd.write(f"ALERT {temperature:.0f}C")
+            print(f"ALERT: High temperature detected - {temperature}C "
+                  f"(threshold: {TEMP_ALERT_THRESHOLD_C}C)")
 
-            # ---- Log to ThingSpeak ----
             send_to_thingspeak(temperature, humidity, moisture_value)
 
-            time.sleep(15)  # ThingSpeak free tier requires >=15s between updates
+            print("High-temperature event logged - resuming monitoring.")
+            time.sleep(2)
+            continue
 
     except KeyboardInterrupt:
         print("Shutting down Smart Cradle system...")
